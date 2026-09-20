@@ -52,30 +52,19 @@ def latest_trade_date(now: datetime) -> str:
 
 
 def fetch_market():
-    """优先使用东方财富概念板块；失败时才回退原项目行业板块。"""
+    """获取概念/题材板块涨跌榜；失败时回退行业板块。"""
     mgr = DataFetcherManager()
-    top, bottom = [], []
-    try:
-        import akshare as ak
-        df = ak.stock_board_concept_name_em()
-        if df is not None and not df.empty and "板块名称" in df.columns and "涨跌幅" in df.columns:
-            clean = df[["板块名称", "涨跌幅"]].copy()
-            clean["涨跌幅"] = pd.to_numeric(clean["涨跌幅"], errors="coerce")
-            clean = clean.dropna(subset=["涨跌幅"]).sort_values("涨跌幅", ascending=False)
-            top = [{"name": r["板块名称"], "change_pct": float(r["涨跌幅"])} for _, r in clean.head(TOP_N).iterrows()]
-            bottom = [{"name": r["板块名称"], "change_pct": float(r["涨跌幅"])} for _, r in clean.tail(TOP_N).sort_values("涨跌幅").iterrows()]
-            print("✅ 使用东方财富概念板块涨跌榜")
-    except Exception as exc:
-        print(f"[warn] 东方财富概念板块获取失败，回退行业板块: {exc}")
-
-    if not top or not bottom:
+    top, bottom = mgr.get_concept_rankings(TOP_N)
+    ranking_type = "概念"
+    if not top and not bottom:
+        print("[warn] 概念板块获取失败，回退行业板块")
         top, bottom = mgr.get_sector_rankings(TOP_N)
+        ranking_type = "行业"
     if not top and not bottom:
         raise RuntimeError("未获取到板块涨跌榜")
     stats = mgr.get_market_stats(purpose="sector_review:cn") or {}
     indices = mgr.get_main_indices(region="cn") or []
-    return top or [], bottom or [], stats, indices
-
+    return top or [], bottom or [], stats, indices, ranking_type
 
 def build_search() -> SearchService | None:
     keys = [x.strip() for x in env("TAVILY_API_KEYS").split(",") if x.strip()]
@@ -183,7 +172,7 @@ def continuity(top: list[dict], previous: dict | None) -> str:
     return "；".join(parts) or "Top5轮动明显。"
 
 
-def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str) -> str:
+def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str, ranking_type: str) -> str:
     idx_map = []
     for x in indices[:3]:
         try:
@@ -199,6 +188,7 @@ def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_tex
 
     lines = [
         f"📊 A股板块复盘｜{trade_date}",
+        f"口径：{ranking_type}板块",
         header,
         (breadth + amount_text) if (breadth or amount_text) else "市场宽度数据暂缺",
         "",
@@ -245,7 +235,7 @@ def main():
     if env("GITHUB_EVENT_NAME") == "schedule" and trade_date != today:
         print(f"⏭️ {today} 非A股交易日，最近交易日为 {trade_date}，定时任务不重复推送。")
         return
-    top, bottom, stats, indices = fetch_market()
+    top, bottom, stats, indices, ranking_type = fetch_market()
     search = build_search()
 
     reasons = {}
@@ -257,13 +247,13 @@ def main():
 
     previous = load_previous()
     cont = continuity(top, previous)
-    report = render(trade_date, top, bottom, stats, indices, reasons, cont)
+    report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type)
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / f"{trade_date}.txt").write_text(report, encoding="utf-8")
 
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"date": trade_date, "top": top, "bottom": bottom, "reasons": reasons}
+    payload = {"date": trade_date, "ranking_type": ranking_type, "top": top, "bottom": bottom, "reasons": reasons}
     (HISTORY_DIR / f"{trade_date}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(report)
