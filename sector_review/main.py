@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import requests
+import pandas as pd
 
 from data_provider.base import DataFetcherManager
 from src.search_service import SearchService
@@ -36,11 +37,41 @@ def pct(v) -> float:
         return 0.0
 
 
+def latest_trade_date(now: datetime) -> str:
+    """返回不晚于当前日期的最近一个上交所交易日。"""
+    try:
+        import exchange_calendars as xcals
+        cal = xcals.get_calendar("XSHG")
+        day = pd.Timestamp(now.date())
+        if cal.is_session(day):
+            return day.strftime("%Y-%m-%d")
+        return cal.date_to_session(day, direction="previous").strftime("%Y-%m-%d")
+    except Exception as exc:
+        print(f"[warn] 交易日历读取失败，回退自然日: {exc}")
+        return now.strftime("%Y-%m-%d")
+
+
 def fetch_market():
+    """优先使用东方财富概念板块；失败时才回退原项目行业板块。"""
     mgr = DataFetcherManager()
-    top, bottom = mgr.get_sector_rankings(TOP_N)
+    top, bottom = [], []
+    try:
+        import akshare as ak
+        df = ak.stock_board_concept_name_em()
+        if df is not None and not df.empty and "板块名称" in df.columns and "涨跌幅" in df.columns:
+            clean = df[["板块名称", "涨跌幅"]].copy()
+            clean["涨跌幅"] = pd.to_numeric(clean["涨跌幅"], errors="coerce")
+            clean = clean.dropna(subset=["涨跌幅"]).sort_values("涨跌幅", ascending=False)
+            top = [{"name": r["板块名称"], "change_pct": float(r["涨跌幅"])} for _, r in clean.head(TOP_N).iterrows()]
+            bottom = [{"name": r["板块名称"], "change_pct": float(r["涨跌幅"])} for _, r in clean.tail(TOP_N).sort_values("涨跌幅").iterrows()]
+            print("✅ 使用东方财富概念板块涨跌榜")
+    except Exception as exc:
+        print(f"[warn] 东方财富概念板块获取失败，回退行业板块: {exc}")
+
+    if not top or not bottom:
+        top, bottom = mgr.get_sector_rankings(TOP_N)
     if not top and not bottom:
-        raise RuntimeError("未获取到行业板块涨跌榜")
+        raise RuntimeError("未获取到板块涨跌榜")
     stats = mgr.get_market_stats(purpose="sector_review:cn") or {}
     indices = mgr.get_main_indices(region="cn") or []
     return top or [], bottom or [], stats, indices
@@ -160,14 +191,16 @@ def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_tex
         except Exception:
             pass
     header = "｜".join(idx_map)
-    breadth = f"上涨 {stats.get('up_count', 0)}｜下跌 {stats.get('down_count', 0)}"
+    up_count = stats.get("up_count")
+    down_count = stats.get("down_count")
+    breadth = f"上涨 {up_count}｜下跌 {down_count}" if up_count is not None and down_count is not None and (up_count or down_count) else ""
     amount = stats.get("total_amount", 0)
     amount_text = f"｜成交 {amount:.0f}亿" if isinstance(amount, (int, float)) and amount else ""
 
     lines = [
         f"📊 A股板块复盘｜{trade_date}",
         header,
-        breadth + amount_text,
+        (breadth + amount_text) if (breadth or amount_text) else "市场宽度数据暂缺",
         "",
         "🔥 强势 Top5",
     ]
@@ -207,7 +240,7 @@ def push_wxpusher(content: str):
 
 def main():
     now = datetime.now(TZ)
-    trade_date = now.strftime("%Y-%m-%d")
+    trade_date = latest_trade_date(now)
     top, bottom, stats, indices = fetch_market()
     search = build_search()
 
