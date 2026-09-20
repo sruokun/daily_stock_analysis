@@ -241,6 +241,10 @@ def push_wxpusher(content: str):
 def main():
     now = datetime.now(TZ)
     trade_date = latest_trade_date(now)
+    today = now.strftime("%Y-%m-%d")
+    if env("GITHUB_EVENT_NAME") == "schedule" and trade_date != today:
+        print(f"⏭️ {today} 非A股交易日，最近交易日为 {trade_date}，定时任务不重复推送。")
+        return
     top, bottom, stats, indices = fetch_market()
     search = build_search()
 
