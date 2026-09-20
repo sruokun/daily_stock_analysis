@@ -76,26 +76,36 @@ def build_search() -> SearchService | None:
 def search_news(service: SearchService | None, sector: str, trade_date: str):
     if not service or not service.is_available:
         return []
-    try:
-        response = service.search_topic_news(
-            f"{trade_date} A股 {sector} 板块 上涨 下跌 原因 催化 政策 行业新闻",
-            max_results=6,
-            focus_keywords=[sector, "A股", "板块"],
-        )
-    except Exception as exc:
-        print(f"[warn] {sector} 搜索失败: {exc}")
-        return []
-    out = []
-    for item in getattr(response, "results", []) or []:
-        out.append({
-            "title": getattr(item, "title", ""),
-            "snippet": getattr(item, "snippet", ""),
-            "url": getattr(item, "url", ""),
-            "source": getattr(item, "source", ""),
-            "published_date": getattr(item, "published_date", None),
-        })
-    return out[:6]
-
+    queries = [
+        f"{trade_date} A股 {sector} 板块 涨停 领涨 上涨 下跌 原因",
+        f"{trade_date} {sector} 政策 产业 数据 涨价 订单 公告 财联社 证券时报",
+    ]
+    out, seen = [], set()
+    for query in queries:
+        try:
+            response = service.search_topic_news(
+                query,
+                max_results=5,
+                focus_keywords=[sector, "A股"],
+            )
+        except Exception as exc:
+            print(f"[warn] {sector} 搜索失败: {exc}")
+            continue
+        for item in getattr(response, "results", []) or []:
+            url = getattr(item, "url", "") or ""
+            title = getattr(item, "title", "") or ""
+            key = url or title
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "title": title,
+                "snippet": getattr(item, "snippet", ""),
+                "url": url,
+                "source": getattr(item, "source", ""),
+                "published_date": getattr(item, "published_date", None),
+            })
+    return out[:8]
 
 def gemini_reason(sector: str, change_pct: float, news: list[dict]) -> dict:
     key = env("GEMINI_API_KEY")
@@ -103,7 +113,7 @@ def gemini_reason(sector: str, change_pct: float, news: list[dict]) -> dict:
         keys = [x.strip() for x in env("GEMINI_API_KEYS").split(",") if x.strip()]
         key = keys[0] if keys else ""
     if not key:
-        return {"reason": "暂无明确直接催化，主要表现为资金/市场风格因素", "confidence": "中"}
+        return {"reason": "暂无明确直接催化，主要表现为资金/市场风格因素", "confidence": "中", "sources": []}
 
     evidence = "\n".join(
         f"- {n.get('source') or '未知来源'} | {n.get('published_date') or '日期未知'} | {n.get('title')} | {n.get('snippet')}"
@@ -123,7 +133,8 @@ def gemini_reason(sector: str, change_pct: float, news: list[dict]) -> dict:
 4. 中：有可靠媒体线索但因果链不够直接；
 5. 如果材料不足，reason固定输出“暂无明确直接催化，主要表现为资金/市场风格因素”；
 6. 不得把市场传闻写成已确认事实；
-7. 只输出JSON：{{"reason":"...","confidence":"高或中"}}。"""
+7. sources最多返回2条真正支持该原因的材料URL；没有直接证据则返回空数组；
+8. 只输出JSON：{{"reason":"...","confidence":"高或中","sources":["url1","url2"]}}。"""
 
     models = [env("GEMINI_MODEL") or "gemini-2.5-flash", env("GEMINI_MODEL_FALLBACK") or "gemini-2.5-flash"]
     for model in dict.fromkeys(models):
@@ -140,10 +151,21 @@ def gemini_reason(sector: str, change_pct: float, news: list[dict]) -> dict:
             reason = str(data.get("reason") or "").strip()
             conf = str(data.get("confidence") or "").strip()
             if reason and conf in {"高", "中"}:
-                return {"reason": reason, "confidence": conf}
+                return {"reason": reason, "confidence": conf, "sources": [str(x) for x in (data.get("sources") or [])[:2] if str(x).startswith("http")]}
         except Exception as exc:
             print(f"[warn] Gemini {model} 归因失败: {exc}")
-    return {"reason": "暂无明确直接催化，主要表现为资金/市场风格因素", "confidence": "中"}
+    return {"reason": "暂无明确直接催化，主要表现为资金/市场风格因素", "confidence": "中", "sources": []}
+
+
+def market_summary(top: list[dict], bottom: list[dict]) -> str:
+    strong = "、".join(str(x.get("name") or "") for x in top[:3] if x.get("name"))
+    weak = "、".join(str(x.get("name") or "") for x in bottom[:3] if x.get("name"))
+    parts = []
+    if strong:
+        parts.append(f"强势集中在{strong}")
+    if weak:
+        parts.append(f"相对弱势为{weak}")
+    return "；".join(parts) + "。" if parts else "板块分化信息暂缺。"
 
 
 def load_previous():
@@ -198,15 +220,19 @@ def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_tex
         name = s.get("name", "")
         p = pct(s.get("change_pct", s.get("涨跌幅", 0)))
         rr = reasons.get(name, {})
-        lines.append(f"{i}. {name} {p:+.2f}%｜{rr.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{rr.get('confidence','中')}】")
+        src = rr.get("sources") or []
+        evidence = "📎" if src else ""
+        lines.append(f"{i}. {name} {p:+.2f}%｜{rr.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{rr.get('confidence','中')}】{evidence}")
     lines += ["", "📉 弱势 Top5"]
     for i, s in enumerate(bottom, 1):
         name = s.get("name", "")
         p = pct(s.get("change_pct", s.get("涨跌幅", 0)))
         rr = reasons.get(name, {})
         label = "相对弱势" if p > -1 else "弱势"
-        lines.append(f"{i}. {name} {p:+.2f}%｜{label}；{rr.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{rr.get('confidence','中')}】")
-    lines += ["", "🔁 主线连续性", continuity_text]
+        src = rr.get("sources") or []
+        evidence = "📎" if src else ""
+        lines.append(f"{i}. {name} {p:+.2f}%｜{label}；{rr.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{rr.get('confidence','中')}】{evidence}")
+    lines += ["", "🎯 今日结构", market_summary(top, bottom), "", "🔁 主线连续性", continuity_text, "", "注：📎表示归因有检索证据；无证据不强行解释。"]
     return "\n".join([x for x in lines if x is not None])
 
 
