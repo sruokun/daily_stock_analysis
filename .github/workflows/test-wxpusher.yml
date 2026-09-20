@@ -1,0 +1,49 @@
+name: 测试 WxPusher
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 发送 WxPusher 测试消息
+        env:
+          WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          spt = os.environ["WXPUSHER_SPT"]
+
+          data = {
+              "content": """
+          <h2>📊 A股行情复盘</h2>
+          <p>GitHub Actions → WxPusher 推送测试成功。</p>
+          <p>如果你看到这条消息，说明自动复盘的微信推送通道已经打通。</p>
+          """,
+              "summary": "A股复盘推送测试",
+              "contentType": 2,
+              "spt": spt
+          }
+
+          req = urllib.request.Request(
+              "https://wxpusher.zjiecode.com/api/send/message/simple-push",
+              data=json.dumps(data).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          with urllib.request.urlopen(req) as response:
+              result = response.read().decode("utf-8")
+              print(result)
+
+              parsed = json.loads(result)
+              if not parsed.get("success"):
+                  raise RuntimeError("WxPusher发送失败：" + result)
+
+          print("✅ WxPusher测试消息发送成功")
+          PY
