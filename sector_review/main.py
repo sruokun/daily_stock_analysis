@@ -22,6 +22,7 @@ from src.search_service import SearchService
 
 TZ = ZoneInfo("Asia/Shanghai")
 TOP_N = 5
+GOLD_KEYWORDS = ("黄金", "贵金属", "金矿", "黄金概念")
 HISTORY_DIR = Path("data/sector_review_history")
 REPORT_DIR = Path("reports/sector_review")
 
@@ -64,7 +65,62 @@ def fetch_market():
         raise RuntimeError("未获取到板块涨跌榜")
     stats = mgr.get_market_stats(purpose="sector_review:cn") or {}
     indices = mgr.get_main_indices(region="cn") or []
-    return top or [], bottom or [], stats, indices, ranking_type
+    return top or [], bottom or [], stats, indices, ranking_type, mgr
+
+def is_gold_sector(name: str) -> bool:
+    text = str(name or "")
+    return any(k in text for k in GOLD_KEYWORDS)
+
+
+def find_gold_rows(mgr: DataFetcherManager, top: list[dict], bottom: list[dict]) -> list[dict]:
+    """尽量定位黄金/贵金属板块；即使不在Top5也单独跟踪。"""
+    found = {}
+    for row in (top or []) + (bottom or []):
+        name = str(row.get("name") or "")
+        if is_gold_sector(name):
+            found[name] = dict(row)
+    try:
+        ctop, cbottom = mgr.get_concept_rankings(200)
+        for row in (ctop or []) + (cbottom or []):
+            name = str(row.get("name") or "")
+            if is_gold_sector(name):
+                found[name] = dict(row)
+    except Exception as exc:
+        print(f"[warn] 黄金概念全榜定位失败: {exc}")
+    return sorted(found.values(), key=lambda x: pct(x.get("change_pct", x.get("涨跌幅", 0))), reverse=True)
+
+
+def gold_search_news(service: SearchService | None, trade_date: str):
+    if not service or not service.is_available:
+        return []
+    queries = [
+        f"{trade_date} 黄金 金价 COMEX 现货黄金 美元 美债 实际利率 美联储 原因",
+        f"{trade_date} A股 黄金 贵金属 金矿 板块 上涨 下跌 原因 紫金黄金 山东黄金 中金黄金",
+        f"{trade_date} 央行 黄金储备 地缘政治 避险 黄金 ETF",
+    ]
+    out, seen = [], set()
+    for query in queries:
+        try:
+            response = service.search_topic_news(query, max_results=5, focus_keywords=["黄金", "贵金属"])
+        except Exception as exc:
+            print(f"[warn] 黄金专题搜索失败: {exc}")
+            continue
+        for item in getattr(response, "results", []) or []:
+            url = getattr(item, "url", "") or ""
+            title = getattr(item, "title", "") or ""
+            key = url or title
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "title": title,
+                "snippet": getattr(item, "snippet", ""),
+                "url": url,
+                "source": getattr(item, "source", ""),
+                "published_date": getattr(item, "published_date", None),
+            })
+    return out[:10]
+
 
 def build_search() -> SearchService | None:
     keys = [x.strip() for x in env("TAVILY_API_KEYS").split(",") if x.strip()]
@@ -194,7 +250,7 @@ def continuity(top: list[dict], previous: dict | None) -> str:
     return "；".join(parts) or "Top5轮动明显。"
 
 
-def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str, ranking_type: str) -> str:
+def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str, ranking_type: str, gold_rows: list[dict], gold_reason: dict) -> str:
     idx_map = []
     for x in indices[:3]:
         try:
@@ -232,6 +288,15 @@ def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_tex
         src = rr.get("sources") or []
         evidence = "📎" if src else ""
         lines.append(f"{i}. {name} {p:+.2f}%｜{label}；{rr.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{rr.get('confidence','中')}】{evidence}")
+    lines += ["", "🥇 黄金重点跟踪"]
+    if gold_rows:
+        for row in gold_rows[:3]:
+            gname = str(row.get("name") or "黄金")
+            gp = pct(row.get("change_pct", row.get("涨跌幅", 0)))
+            lines.append(f"{gname} {gp:+.2f}%｜{gold_reason.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{gold_reason.get('confidence','中')}】" + ("📎" if gold_reason.get("sources") else ""))
+    else:
+        lines.append("黄金/贵金属板块当前未能从榜单定位，仍保留宏观催化跟踪。")
+        lines.append(f"驱动观察｜{gold_reason.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{gold_reason.get('confidence','中')}】" + ("📎" if gold_reason.get("sources") else ""))
     lines += ["", "🎯 今日结构", market_summary(top, bottom), "", "🔁 主线连续性", continuity_text, "", "注：📎表示归因有检索证据；无证据不强行解释。"]
     return "\n".join([x for x in lines if x is not None])
 
@@ -261,7 +326,7 @@ def main():
     if env("GITHUB_EVENT_NAME") == "schedule" and trade_date != today:
         print(f"⏭️ {today} 非A股交易日，最近交易日为 {trade_date}，定时任务不重复推送。")
         return
-    top, bottom, stats, indices, ranking_type = fetch_market()
+    top, bottom, stats, indices, ranking_type, mgr = fetch_market()
     search = build_search()
 
     reasons = {}
@@ -271,15 +336,20 @@ def main():
         news = search_news(search, name, trade_date)
         reasons[name] = gemini_reason(name, change, news)
 
+    gold_rows = find_gold_rows(mgr, top, bottom)
+    gold_news = gold_search_news(search, trade_date)
+    gold_change = pct(gold_rows[0].get("change_pct", gold_rows[0].get("涨跌幅", 0))) if gold_rows else 0.0
+    gold_reason = gemini_reason("黄金/贵金属", gold_change, gold_news)
+
     previous = load_previous()
     cont = continuity(top, previous)
-    report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type)
+    report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type, gold_rows, gold_reason)
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / f"{trade_date}.txt").write_text(report, encoding="utf-8")
 
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"date": trade_date, "ranking_type": ranking_type, "top": top, "bottom": bottom, "reasons": reasons}
+    payload = {"date": trade_date, "ranking_type": ranking_type, "top": top, "bottom": bottom, "reasons": reasons, "gold": {"rows": gold_rows, "reason": gold_reason}}
     (HISTORY_DIR / f"{trade_date}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(report)
