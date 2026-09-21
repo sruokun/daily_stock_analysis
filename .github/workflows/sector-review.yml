@@ -45,6 +45,7 @@ jobs:
         run: python sector_review/main.py
 
       - name: 保存复盘历史
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -53,5 +54,9 @@ jobs:
             echo "没有新历史数据"
           else
             git commit -m "chore: save sector review history"
-            git push
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push && break
+              echo "push失败，第$i次重试..."
+              sleep $((i * 5))
+            done
           fi
