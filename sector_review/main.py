@@ -299,9 +299,11 @@ def market_summary(top: list[dict], bottom: list[dict]) -> str:
     return "；".join(parts) + "。" if parts else "板块分化信息暂缺。"
 
 
-def load_previous():
+def load_previous(before_date: str | None = None):
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(HISTORY_DIR.glob("*.json"))
+    if before_date:
+        files = [p for p in files if p.stem < before_date]
     if not files:
         return None
     try:
@@ -393,7 +395,8 @@ def push_wxpusher(content: str):
     r = requests.post("https://wxpusher.zjiecode.com/api/send/message/simple-push", json=payload, timeout=20)
     r.raise_for_status()
     data = r.json()
-    if not data.get("success"):
+    ok = data.get("success") is True or data.get("code") in (0, 1000) or str(data.get("code")) in {"0", "1000"}
+    if not ok:
         raise RuntimeError(f"WxPusher发送失败: {data}")
     print("✅ WxPusher 推送成功")
 
@@ -404,6 +407,11 @@ def main():
     today = now.strftime("%Y-%m-%d")
     if env("GITHUB_EVENT_NAME") == "schedule" and trade_date != today:
         print(f"⏭️ {today} 非A股交易日，最近交易日为 {trade_date}，定时任务不重复推送。")
+        return
+    # 15:50 是兜底任务：若15:20已经成功并把当日报告提交回仓库，则不重复推送。
+    report_path = REPORT_DIR / f"{trade_date}.txt"
+    if env("GITHUB_EVENT_NAME") == "schedule" and report_path.exists():
+        print(f"⏭️ {trade_date} 已存在成功复盘报告，跳过重复定时推送。")
         return
     top, bottom, stats, indices, ranking_type, mgr = fetch_market()
     search = build_search()
@@ -421,7 +429,7 @@ def main():
     gold_reason = gemini_reason("黄金/贵金属", gold_change, gold_news)
     gold_detail = gemini_gold_analysis(gold_change, gold_news)
 
-    previous = load_previous()
+    previous = load_previous(trade_date)
     gold_trend = gold_history_signal(gold_rows, previous)
     cont = continuity(top, previous)
     report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type, gold_rows, gold_reason, gold_detail, gold_trend)
