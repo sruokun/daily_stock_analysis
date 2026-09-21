@@ -213,6 +213,81 @@ def gemini_reason(sector: str, change_pct: float, news: list[dict]) -> dict:
     return {"reason": "暂无明确直接催化，主要表现为资金/市场风格因素", "confidence": "中", "sources": []}
 
 
+def gemini_gold_analysis(change_pct: float, news: list[dict]) -> dict:
+    """黄金专题：拆分宏观驱动、A股联动与风险点，不给交易指令。"""
+    key = env("GEMINI_API_KEY")
+    if not key:
+        keys = [x.strip() for x in env("GEMINI_API_KEYS").split(",") if x.strip()]
+        key = keys[0] if keys else ""
+    fallback = {
+        "signal": "中性", "macro": "暂无足够可靠材料判断黄金宏观驱动",
+        "ashare": "A股黄金板块联动信息不足", "risk": "关注金价、美元及美债利率变化",
+        "confidence": "中", "sources": []
+    }
+    if not key:
+        return fallback
+    evidence = "\n".join(
+        f"- {n.get('source') or '未知来源'} | {n.get('published_date') or '日期未知'} | {n.get('title')} | {n.get('snippet')} | {n.get('url')}"
+        for n in news[:10]
+    ) or "无可靠检索结果"
+    prompt = f"""你是黄金与A股贵金属板块盘后复盘助手。只能使用给出的检索材料，不得补充未提供的事实。
+A股黄金/贵金属板块代表涨跌幅：{change_pct:+.2f}%
+材料：
+{evidence}
+
+请区分“国际黄金宏观驱动”和“A股黄金股表现”，不要把相关性写成确定因果。
+signal只能是“强化”“延续”“降温”“中性”之一；只有材料足够时才能使用强化/延续/降温。
+macro最多55字，概括金价、美元/美债利率、美联储、央行购金、避险中有证据的核心变量。
+ashare最多45字，概括A股黄金/贵金属板块与国际金价是否同向及可验证催化。
+risk最多45字，写未来1-3个交易日最值得观察的反向风险/验证点，不给买卖建议。
+confidence只能“高”或“中”。sources最多2个真正支持判断的URL；无直接证据则空数组。
+只输出JSON：
+{{"signal":"强化/延续/降温/中性","macro":"...","ashare":"...","risk":"...","confidence":"高或中","sources":[]}}"""
+    models = [env("GEMINI_MODEL") or "gemini-2.5-flash", env("GEMINI_MODEL_FALLBACK") or "gemini-2.5-flash"]
+    for model in dict.fromkeys(models):
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            payload = {"contents": [{"parts": [{"text": prompt}]}],
+                       "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}}
+            r = requests.post(url, json=payload, timeout=45)
+            r.raise_for_status()
+            data = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            if data.get("signal") not in {"强化", "延续", "降温", "中性"}:
+                data["signal"] = "中性"
+            if data.get("confidence") not in {"高", "中"}:
+                data["confidence"] = "中"
+            data["sources"] = [str(x) for x in (data.get("sources") or [])[:2] if str(x).startswith("http")]
+            return {**fallback, **data}
+        except Exception as exc:
+            print(f"[warn] Gemini {model} 黄金专题分析失败: {exc}")
+    return fallback
+
+
+def gold_history_signal(gold_rows: list[dict], previous: dict | None) -> str:
+    """用历史板块涨跌记录给出客观的连续性标签。"""
+    if not gold_rows:
+        return "本日未定位到黄金概念板块"
+    cur = pct(gold_rows[0].get("change_pct", gold_rows[0].get("涨跌幅", 0)))
+    if not previous:
+        return f"今日 {cur:+.2f}%，开始积累连续性样本"
+    prev_rows = ((previous.get("gold") or {}).get("rows") or [])
+    if not prev_rows:
+        return f"今日 {cur:+.2f}%，昨日无可比黄金板块样本"
+    prev = pct(prev_rows[0].get("change_pct", prev_rows[0].get("涨跌幅", 0)))
+    if cur > 0 and prev > 0:
+        state = "连续走强"
+    elif cur < 0 and prev < 0:
+        state = "连续走弱"
+    elif cur > 0 >= prev:
+        state = "由弱转强"
+    elif cur < 0 <= prev:
+        state = "由强转弱"
+    else:
+        state = "震荡"
+    return f"{state}｜昨日 {prev:+.2f}% → 今日 {cur:+.2f}%"
+
+
+
 def market_summary(top: list[dict], bottom: list[dict]) -> str:
     strong = "、".join(str(x.get("name") or "") for x in top[:3] if x.get("name"))
     weak = "、".join(str(x.get("name") or "") for x in bottom[:3] if x.get("name"))
@@ -250,7 +325,7 @@ def continuity(top: list[dict], previous: dict | None) -> str:
     return "；".join(parts) or "Top5轮动明显。"
 
 
-def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str, ranking_type: str, gold_rows: list[dict], gold_reason: dict) -> str:
+def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str, ranking_type: str, gold_rows: list[dict], gold_reason: dict, gold_detail: dict, gold_trend: str) -> str:
     idx_map = []
     for x in indices[:3]:
         try:
@@ -293,10 +368,14 @@ def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_tex
         for row in gold_rows[:3]:
             gname = str(row.get("name") or "黄金")
             gp = pct(row.get("change_pct", row.get("涨跌幅", 0)))
-            lines.append(f"{gname} {gp:+.2f}%｜{gold_reason.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{gold_reason.get('confidence','中')}】" + ("📎" if gold_reason.get("sources") else ""))
+            lines.append(f"{gname} {gp:+.2f}%")
     else:
-        lines.append("黄金/贵金属板块当前未能从榜单定位，仍保留宏观催化跟踪。")
-        lines.append(f"驱动观察｜{gold_reason.get('reason','暂无明确直接催化，主要表现为资金/市场风格因素')}【{gold_reason.get('confidence','中')}】" + ("📎" if gold_reason.get("sources") else ""))
+        lines.append("黄金/贵金属板块当前未能从概念榜定位")
+    lines.append(f"趋势｜{gold_trend}")
+    lines.append(f"状态｜{gold_detail.get('signal','中性')}【{gold_detail.get('confidence','中')}】" + ("📎" if gold_detail.get("sources") else ""))
+    lines.append(f"宏观｜{gold_detail.get('macro','暂无足够可靠材料判断黄金宏观驱动')}")
+    lines.append(f"A股｜{gold_detail.get('ashare', gold_reason.get('reason','A股黄金板块联动信息不足'))}")
+    lines.append(f"观察｜{gold_detail.get('risk','关注金价、美元及美债利率变化')}")
     lines += ["", "🎯 今日结构", market_summary(top, bottom), "", "🔁 主线连续性", continuity_text, "", "注：📎表示归因有检索证据；无证据不强行解释。"]
     return "\n".join([x for x in lines if x is not None])
 
@@ -340,16 +419,18 @@ def main():
     gold_news = gold_search_news(search, trade_date)
     gold_change = pct(gold_rows[0].get("change_pct", gold_rows[0].get("涨跌幅", 0))) if gold_rows else 0.0
     gold_reason = gemini_reason("黄金/贵金属", gold_change, gold_news)
+    gold_detail = gemini_gold_analysis(gold_change, gold_news)
 
     previous = load_previous()
+    gold_trend = gold_history_signal(gold_rows, previous)
     cont = continuity(top, previous)
-    report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type, gold_rows, gold_reason)
+    report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type, gold_rows, gold_reason, gold_detail, gold_trend)
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / f"{trade_date}.txt").write_text(report, encoding="utf-8")
 
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"date": trade_date, "ranking_type": ranking_type, "top": top, "bottom": bottom, "reasons": reasons, "gold": {"rows": gold_rows, "reason": gold_reason}}
+    payload = {"date": trade_date, "ranking_type": ranking_type, "top": top, "bottom": bottom, "reasons": reasons, "gold": {"rows": gold_rows, "reason": gold_reason, "detail": gold_detail, "trend": gold_trend}}
     (HISTORY_DIR / f"{trade_date}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(report)
