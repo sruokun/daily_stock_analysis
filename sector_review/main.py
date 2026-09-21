@@ -90,6 +90,47 @@ def find_gold_rows(mgr: DataFetcherManager, top: list[dict], bottom: list[dict])
     return sorted(found.values(), key=lambda x: pct(x.get("change_pct", x.get("涨跌幅", 0))), reverse=True)
 
 
+def fetch_gold_macro_market() -> dict:
+    """获取黄金宏观交叉验证行情。Yahoo失败时返回部分/空数据，不影响主报告。"""
+    symbols = {
+        "gold": ("GC=F", "COMEX黄金"),
+        "usd": ("DX-Y.NYB", "美元指数"),
+        "us10y": ("^TNX", "美国10年期国债收益率"),
+        "gold_etf": ("GLD", "黄金ETF(GLD)"),
+    }
+    out = {}
+    try:
+        import yfinance as yf
+        for key, (symbol, label) in symbols.items():
+            try:
+                hist = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=False)
+                if hist is None or hist.empty:
+                    continue
+                closes = hist["Close"].dropna()
+                if closes.empty:
+                    continue
+                last = float(closes.iloc[-1])
+                prev = float(closes.iloc[-2]) if len(closes) >= 2 else None
+                change = ((last / prev) - 1) * 100 if prev not in (None, 0) else None
+                out[key] = {"symbol": symbol, "label": label, "last": last, "change_pct": change}
+            except Exception as exc:
+                print(f"[warn] {label}行情获取失败: {exc}")
+    except Exception as exc:
+        print(f"[warn] yfinance黄金宏观行情不可用: {exc}")
+    return out
+
+
+def format_gold_macro_market(market: dict) -> str:
+    parts = []
+    for key in ("gold", "usd", "us10y", "gold_etf"):
+        item = market.get(key) or {}
+        if item.get("change_pct") is None:
+            continue
+        parts.append(f"{item.get('label')} {pct(item.get('change_pct')):+.2f}%")
+    return "｜".join(parts) if parts else "国际黄金/美元/美债行情暂缺"
+
+
+
 def gold_search_news(service: SearchService | None, trade_date: str):
     if not service or not service.is_available:
         return []
@@ -213,7 +254,7 @@ def gemini_reason(sector: str, change_pct: float, news: list[dict]) -> dict:
     return {"reason": "暂无明确直接催化，主要表现为资金/市场风格因素", "confidence": "中", "sources": []}
 
 
-def gemini_gold_analysis(change_pct: float, news: list[dict]) -> dict:
+def gemini_gold_analysis(change_pct: float, news: list[dict], macro_market: dict | None = None) -> dict:
     """黄金专题：拆分宏观驱动、A股联动与风险点，不给交易指令。"""
     key = env("GEMINI_API_KEY")
     if not key:
@@ -230,9 +271,13 @@ def gemini_gold_analysis(change_pct: float, news: list[dict]) -> dict:
         f"- {n.get('source') or '未知来源'} | {n.get('published_date') or '日期未知'} | {n.get('title')} | {n.get('snippet')} | {n.get('url')}"
         for n in news[:10]
     ) or "无可靠检索结果"
-    prompt = f"""你是黄金与A股贵金属板块盘后复盘助手。只能使用给出的检索材料，不得补充未提供的事实。
+    macro_market = macro_market or {}
+    market_evidence = format_gold_macro_market(macro_market)
+    prompt = f"""你是黄金与A股贵金属板块盘后复盘助手。只能使用给出的检索材料和结构化行情，不得补充未提供的事实。
 A股黄金/贵金属板块代表涨跌幅：{change_pct:+.2f}%
-材料：
+结构化行情（Yahoo Finance，仅作为市场交叉验证；收益率字段的百分比变化不是利率百分点变化）：
+{market_evidence}
+新闻材料：
 {evidence}
 
 请区分“国际黄金宏观驱动”和“A股黄金股表现”，不要把相关性写成确定因果。
@@ -327,7 +372,7 @@ def continuity(top: list[dict], previous: dict | None) -> str:
     return "；".join(parts) or "Top5轮动明显。"
 
 
-def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str, ranking_type: str, gold_rows: list[dict], gold_reason: dict, gold_detail: dict, gold_trend: str) -> str:
+def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_text: str, ranking_type: str, gold_rows: list[dict], gold_reason: dict, gold_detail: dict, gold_trend: str, gold_macro_market: dict) -> str:
     idx_map = []
     for x in indices[:3]:
         try:
@@ -373,6 +418,7 @@ def render(trade_date: str, top, bottom, stats, indices, reasons, continuity_tex
             lines.append(f"{gname} {gp:+.2f}%")
     else:
         lines.append("黄金/贵金属板块当前未能从概念榜定位")
+    lines.append(f"国际｜{format_gold_macro_market(gold_macro_market)}")
     lines.append(f"趋势｜{gold_trend}")
     lines.append(f"状态｜{gold_detail.get('signal','中性')}【{gold_detail.get('confidence','中')}】" + ("📎" if gold_detail.get("sources") else ""))
     lines.append(f"宏观｜{gold_detail.get('macro','暂无足够可靠材料判断黄金宏观驱动')}")
@@ -427,18 +473,19 @@ def main():
     gold_news = gold_search_news(search, trade_date)
     gold_change = pct(gold_rows[0].get("change_pct", gold_rows[0].get("涨跌幅", 0))) if gold_rows else 0.0
     gold_reason = gemini_reason("黄金/贵金属", gold_change, gold_news)
-    gold_detail = gemini_gold_analysis(gold_change, gold_news)
+    gold_macro_market = fetch_gold_macro_market()
+    gold_detail = gemini_gold_analysis(gold_change, gold_news, gold_macro_market)
 
     previous = load_previous(trade_date)
     gold_trend = gold_history_signal(gold_rows, previous)
     cont = continuity(top, previous)
-    report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type, gold_rows, gold_reason, gold_detail, gold_trend)
+    report = render(trade_date, top, bottom, stats, indices, reasons, cont, ranking_type, gold_rows, gold_reason, gold_detail, gold_trend, gold_macro_market)
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / f"{trade_date}.txt").write_text(report, encoding="utf-8")
 
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"date": trade_date, "ranking_type": ranking_type, "top": top, "bottom": bottom, "reasons": reasons, "gold": {"rows": gold_rows, "reason": gold_reason, "detail": gold_detail, "trend": gold_trend}}
+    payload = {"date": trade_date, "ranking_type": ranking_type, "top": top, "bottom": bottom, "reasons": reasons, "gold": {"rows": gold_rows, "reason": gold_reason, "detail": gold_detail, "trend": gold_trend, "macro_market": gold_macro_market}}
     (HISTORY_DIR / f"{trade_date}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(report)
