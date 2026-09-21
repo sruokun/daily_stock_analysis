@@ -2,7 +2,8 @@ name: A股板块复盘
 
 on:
   schedule:
-    - cron: '20 7 * * 1-5'   # 北京时间15:20
+    - cron: '20 7 * * 1-5'   # UTC 07:20 / 北京时间15:20
+    - cron: '50 7 * * 1-5'   # UTC 07:50 / 北京时间15:50，兜底补跑
   workflow_dispatch:
 
 concurrency:
